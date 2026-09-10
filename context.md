@@ -40,5 +40,12 @@ SIH26052 — fine-tuning Facebook Research's Denoiser (dns48 checkpoint) for def
 - No real-time streaming inference (batch/offline only, for now).
 - No mobile/edge deployment until Export phase (Phase 5), and only ONNX → CoreML/TFLite.
 
+## Environment / dependencies
+- **torch==2.14.0**, **torchaudio==2.11.0** — exact-pinned in `requirements.txt`. This is the correct current pairing: torchaudio's release cadence lags torch's, so no `2.14.x` torchaudio exists on PyPI. Verified directly against PyPI's JSON API, not assumed.
+- **denoiser==0.1.5** (unpinned in requirements — see below) has two confirmed runtime breakages against torch 2.14/torchaudio 2.11: `torchaudio.get_audio_backend()` removed, and `torch.stft()` requires `return_complex` now. Both patched locally.
+- **Do not import `denoiser.audio` or `denoiser.stft_loss` directly** — use `src/vendor/denoiser_patched/audio.py` (`Audioset`, `find_audio_files`, `get_info`) and `src/vendor/denoiser_patched/stft_loss.py` (`MultiResolutionSTFTLoss`) instead. Everything else from `denoiser` (model architecture, pretrained checkpoint loading, `convert_audio`/resample) is used as-is from the pip package. Full patch rationale/diffs in `src/vendor/denoiser_patched/README.md`.
+- **All audio file I/O goes through `soundfile`, not `torchaudio.load`/`torchaudio.save`.** torchaudio 2.11's I/O backend requires `torchcodec`, which requires native FFmpeg linking that failed to load on this machine (missing dylib on the linker search path) and was judged too fragile to depend on (this project may later move to Colab/Kaggle if MPS training hits limits). `torchaudio` stays installed for non-I/O ops; `torchcodec` is not a dependency.
+- MPS backend confirmed working (`torch.backends.mps.is_available()` → `True`) after all of the above.
+
 ## Current phase
 **Phase 0 — Scaffold.** Repo structure, gitignore, venv, and dependency install only. No data-mixing, model-loading, or training code exists yet.
