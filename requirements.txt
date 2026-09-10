@@ -1,0 +1,10 @@
+torch
+torchaudio
+denoiser
+pystoi
+pesq
+numpy
+scipy
+soundfile
+pyyaml
+tqdm
