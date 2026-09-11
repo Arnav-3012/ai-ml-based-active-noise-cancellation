@@ -3,6 +3,11 @@ data/processed/
 *.wav
 *.pt
 *.onnx
+*.onnx.data
+*.mlpackage/
+checkpoints/coreml/
+checkpoints/onnx/
+ANCDemo/ANCDemo/Resources/*.mlpackage/
 __pycache__/
 .venv/
 *.pyc
