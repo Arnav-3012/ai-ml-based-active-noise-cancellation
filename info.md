@@ -3,10 +3,10 @@
 Stable reference doc. Fill in placeholders as decisions are made in later phases.
 
 ## Dataset paths
-- LibriSpeech dev-clean: `data/raw/librispeech/` — *(source URL / version TBD in Phase 1)*
-- MUSAN (noise/all): `data/raw/musan/` — *(source URL / version TBD in Phase 1)*
-- ESC-50 (gunshot category): `data/raw/esc50/` — *(source URL / version TBD in Phase 1)*
-- Kabealo Zenodo gunshot dataset: `data/raw/gunshots/` — *(Zenodo record ID / DOI TBD in Phase 1)*
+- LibriSpeech dev-clean: `data/raw/librispeech/` — https://www.openslr.org/resources/12/dev-clean.tar.gz
+- MUSAN (noise/all): `data/raw/musan/` — https://www.openslr.org/resources/17/musan.tar.gz
+- UrbanSound8K (gun_shot category): `data/raw/urbansound8k/` — https://zenodo.org/records/1203745/files/UrbanSound8K.tar.gz *(replaces ESC-50, which was found to have no gun_shot class — not yet downloaded)*
+- Kabealo Zenodo gunshot dataset: `data/raw/gunshots/` — https://zenodo.org/records/7004819 (Kabealo, Wyatt et al., "A multi-firearm, multi-orientation audio dataset of gunshots," Data in Brief 2023, DOI 10.1016/j.dib.2023.109091) — *(not yet downloaded; requires manual step, see logs.md)*
 
 ## dns48 checkpoint
 - Source: *(TBD — facebookresearch/denoiser release URL / torch hub identifier, to be filled in Phase 3)*

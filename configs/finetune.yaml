@@ -1,0 +1,101 @@
+# configs/finetune.yaml
+# Single source of truth for all tunable values in the data pipeline (and,
+# later, fine-tuning). Per CLAUDE.md rule 1: no magic numbers in .py files —
+# everything tunable lives here and code reads from this file.
+
+seed: 42
+
+sample_rate: 16000
+
+# --- Dataset targets (used by download.py to know how much to fetch/sample) ---
+dataset:
+  librispeech:
+    subset: "dev-clean"
+    url: "https://www.openslr.org/resources/12/dev-clean.tar.gz"
+    target_utterances_min: 2000
+    target_utterances_max: 2500
+  musan:
+    url: "https://www.openslr.org/resources/17/musan.tar.gz"
+    category: "noise"  # use all clips under musan/noise/**
+  urbansound8k:
+    # ESC-50 was originally planned here but does NOT have a gun_shot class
+    # (verified directly against its 50 official categories) -- replaced with
+    # UrbanSound8K, which has a real gun_shot class (classID 6) and is
+    # directly downloadable (no manual Zenodo click-through, unlike the
+    # Kabealo dataset below).
+    url: "https://zenodo.org/records/1203745/files/UrbanSound8K.tar.gz"
+    target_class: "gun_shot"
+    expected_clip_count: 300
+  gunshots:
+    # Kabealo, Wyatt et al., "A multi-firearm, multi-orientation audio
+    # dataset of gunshots" (Data in Brief, 2023; DOI 10.1016/j.dib.2023.109091).
+    # 2,148 samples across 4 firearms, 27 mics/9 phones/Raspberry Pi mics.
+    # No stable programmatic API on Zenodo (record requires manual download /
+    # access click-through). download.py detects this and prints manual
+    # instructions instead of failing silently.
+    # Decision: use the full set (all 2,148 clips) rather than a sampled
+    # subset -- more real diversity for training, and download.py's
+    # check only needs a lower bound to confirm the manual step succeeded.
+    zenodo_record_id: "7004819"
+    zenodo_url: "https://zenodo.org/records/7004819"
+    sample_min: 2000
+    sample_max: 2148
+
+# --- Mixing (SNR-targeted noisy/clean pair generation) ---
+mixing:
+  snr_db_min: -5
+  snr_db_max: 15
+  noise_categories:
+    - gunshot     # UrbanSound8K gun_shot + Kabealo Zenodo gunshot dataset
+    - stationary  # MUSAN noise clips classified as steady-state/ambient
+    - general     # remaining MUSAN noise clips (non-stationary, non-gunshot)
+  # RMS floor to avoid divide-by-zero when scaling near-silent noise clips
+  eps: 1.0e-8
+
+# --- Augmentation (applied post-mixing) ---
+augment:
+  reverb:
+    probability: 0.3
+    room_scale_min: 0.1
+    room_scale_max: 1.0
+    reverberance_min: 20
+    reverberance_max: 80
+  clipping:
+    probability: 0.15
+    clip_percentile_min: 0.95
+    clip_percentile_max: 0.999
+
+# --- Speaker-disjoint split ---
+split:
+  train_ratio: 0.8
+  val_ratio: 0.1
+  test_ratio: 0.1
+
+# --- Output audio format ---
+output:
+  bit_depth: "PCM_16"
+  format: "wav"
+
+# --- Phase 2: spectral subtraction baseline ---
+baseline:
+  stft:
+    n_fft: 512          # 32ms window at 16kHz -- standard speech-band STFT size
+    hop_length: 128      # 25% overlap-add hop (n_fft / 4), safe for Hann COLA
+    win_length: 512
+    window: "hann"
+  # Noise magnitude spectrum is estimated by averaging the STFT magnitude
+  # over the first `noise_estimate_frames` frames of the NOISY signal itself,
+  # assuming that leading segment is noise-only. This is the classic
+  # Boll (1979) "voice activity detector-free" convention used in most
+  # spectral-subtraction tutorials/references when no separate noise-only
+  # recording is available -- see comment in spectral_subtraction.py for why
+  # this is the right call for this dataset (mixing.py always places the full
+  # noise clip under the full utterance, so segment-initial frames are not
+  # guaranteed silence -- documented as a known limitation, not a bug).
+  noise_estimate_frames: 6
+  oversubtraction_factor: 1.5   # alpha in Berouti et al. (1979) oversubtraction
+  spectral_floor: 0.02          # beta: floor as a fraction of noisy magnitude, avoids musical-noise zeros going negative
+
+# --- Phase 2: evaluation ---
+eval:
+  pesq_mode: "wb"   # wideband PESQ (ITU-T P.862.2), correct mode for 16kHz speech
