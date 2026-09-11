@@ -3,277 +3,110 @@
 > This file is overwritten fully each session. It reflects *current* state only — history lives in `logs.md`.
 
 ## Project
-SIH26052 — fine-tuning Facebook Research's Denoiser (dns48 checkpoint) for defence-noise speech enhancement (e.g. gunshots, battlefield/vehicle noise) on top of clean/noisy speech pairs.
+SIH26052 — fine-tuning Facebook Research's Denoiser (dns48 checkpoint) for defence-noise speech enhancement (e.g. gunshots, battlefield/vehicle noise) on top of clean/noisy speech pairs, deployed as a real-time-feeling on-device iOS demo.
 
 ## Model
-- Base: **dns48** (Facebook Research `denoiser`), ~18.9M params.
-- Verified warm inference latency: **~9ms/sec of audio** on MPS (M4 Pro).
-- Fine-tuned via transfer learning only — no training from scratch.
+- Base: **dns48** (Facebook Research `denoiser`), **18,867,937 params** (exact, not the rounded "~18.9M").
+- Fine-tuned via transfer learning only — no training from scratch (CLAUDE.md rule 6).
+- **v5 is the FINAL, locked fine-tuned model** (locked 2026-09-11, no further training planned). Checkpoint: `checkpoints/dns48_finetuned_v5_best.pt`, best-val epoch 27 of 42 run, `val_total_loss=0.13689` (best of all four versions: v1/v2/v4/v5).
+- Verified warm inference latency: **~7-9ms/sec of audio** on MPS (M4 Pro, PyTorch). **On-device (iPhone, Core ML INT8): ~274ms cold (first call), ~53-55ms warm** — same cold/warm-per-unique-shape pattern as the Mac, now also confirmed on Core ML.
+- Shipped for on-device deployment: `dns48_finetuned_v5_int8.mlpackage` (18MB, weights-only INT8 quantization, verified rounding-level accuracy delta vs. fp32). Shipping precision is **locked at FLOAT32 for the reference/verification artifact** on defence-context safety-margin grounds (fp16 rejected despite acceptable isolated drift, due to ~111x real-time headroom making the speed/size tradeoff unnecessary); INT8 is a separately verified, available option for app-bundle-size reasons specifically, not a change to that safety-margin call.
 
 ## Datasets — ALL DOWNLOADED
 - **LibriSpeech dev-clean** — 2703 utterances, 40 speakers (clean speech source). Native 16kHz.
 - **MUSAN** — 930 noise clips (noise/all subset: 87 "stationary" from sound-bible subfolder, 843 "general"). Native 16kHz.
-- **UrbanSound8K** — gun_shot category (classID 6). Replaces ESC-50 (originally planned but
-  verified to have NO gun_shot class among its 50 official categories — real dataset-selection
-  error caught when the ESC-50 step returned 0 clips on the user's actual run). Downloaded from
-  Zenodo (https://zenodo.org/records/1203745/files/UrbanSound8K.tar.gz, ~6GB tarball, all 10
-  classes — only gun_shot kept, rest discarded). Native rate mixed 44.1/48/96kHz.
-- **Kabealo Zenodo gunshot dataset** — Zenodo record 7004819 (Kabealo, Wyatt et al., "A
-  multi-firearm, multi-orientation audio dataset of gunshots," Data in Brief 2023). User had
-  already manually downloaded all 2,148 clips (4 firearms: remington_870_12_gauge, glock_17_9mm,
-  ruger_ar_556_dot223, 38s&ws_dot38) to `~/edge-collected-gunshot-audio/`; copied in full (not
-  sampled — decision made to keep full diversity) into `data/raw/gunshots/`. Native rate 44.1kHz.
-- Combined gunshot noise pool: 2522 clips (2148 Kabealo + ~374 UrbanSound8K).
+- **UrbanSound8K** — gun_shot category (classID 6). Replaces ESC-50 (verified to have NO gun_shot class). Native rate mixed 44.1/48/96kHz.
+- **Kabealo Zenodo gunshot dataset** — Zenodo record 7004819, full 2,148-clip set (not sampled) in `data/raw/gunshots/`. Native 44.1kHz.
+- Combined gunshot noise pool (static, v1-v4 era): 2522 clips (2148 Kabealo + ~374 UrbanSound8K).
+- **v5's expanded dynamic speech pool:** 134 speakers / 44.71 hours (vs. the original static split's 32 speakers/2,162 utterances) — see "v5 fine-tuning" section below.
 
-## Data pipeline — PHASE 1 COMPLETE, verified with real output
-- Mixing: SNR-targeted, range **-5 dB to 15 dB** (confirmed in manifest `snr_db` values).
-- Split: **speaker-disjoint**, 80/10/10 by speaker — train 32 speakers/2162 utterances, val 4/242,
-  test 4/299. Verified zero speaker-ID overlap across all three splits.
-- Augmentation: reverb (p=0.3) + clipping (p=0.15), post-mixing.
-- Noise-source resampling: MUSAN/LibriSpeech are natively 16kHz; UrbanSound8K and Kabealo
-  gunshots are not (44.1-96kHz). Initial `build_dataset.py` run crashed on this (strict
-  sample-rate check, by design, meant to catch real bugs — but this was expected raw-source
-  variation, not a bug). Fixed by adding `_load_noise_wav()` which resamples noise clips
-  on-the-fly via `torchaudio.functional.resample` (pure tensor op, no I/O backend) during
-  mixing; clean-speech loading (`_load_wav()`) stays strict since LibriSpeech is always 16kHz
-  natively, so a mismatch there would mean an actual problem.
-- Output verified: `data/processed/{train,val,test}/` contain clean+noisy wav pairs (16kHz mono
-  PCM_16, confirmed via `soundfile.info()`), `manifests/{train,val,test}.json` contain one entry
-  per pair with pair_id/paths/speaker_id/split/snr_db/noise_category/noise_source/source_utterance.
+## Data pipeline — PHASE 1 COMPLETE (static manifests), v5 supersedes with dynamic mixing
+- Static manifests (used by v1/v2/v4): SNR-targeted mixing, range **-5 dB to 15 dB**, speaker-disjoint 80/10/10 split — train 32 speakers/2162 utterances, val 4/242, test 4/299 (zero speaker-ID overlap, verified). Augmentation: reverb (p=0.3) + clipping (p=0.15).
+- **v5 replaced the static train manifest with dynamic on-the-fly mixing** (`src/data/dynamic_dataset.py`, `src/data/build_dynamic_pool.py`, `manifests/dynamic_train_pool.json`) — fresh mixtures drawn per step from a 134-speaker/44.71hr speech pool, uniform 1/3-per-category noise weights (matches v1-v4's natural balance), `steps_per_epoch=270` kept identical to v1-v4 for comparability. Val/test splits are unchanged (same fixed 242/299 pairs used across all versions, for fair comparison).
+- Noise-source resampling: `_load_noise_wav()` resamples non-16kHz noise (UrbanSound8K/Kabealo) on-the-fly via `torchaudio.functional.resample`; clean speech loading stays strict (LibriSpeech always native 16kHz).
 
 ## Baseline — PHASE 2 COMPLETE, verified with real output
-- Hand-built **spectral subtraction** (not `noisereduce` or any third-party library) — `src/baseline/spectral_subtraction.py`. STFT-domain, noise estimated from the first N frames of the noisy signal (Boll 1979 convention), Berouti et al. 1979 oversubtraction + spectral floor. Reads/writes via `soundfile` only.
+- Hand-built **spectral subtraction** — `src/baseline/spectral_subtraction.py`. STFT-domain, Boll 1979 noise estimate + Berouti et al. 1979 oversubtraction/floor.
 - Tunables (`baseline.*` in `configs/finetune.yaml`): `stft.{n_fft=512, hop_length=128, win_length=512}`, `noise_estimate_frames=6`, `oversubtraction_factor=1.5`, `spectral_floor=0.02`.
-- Known documented limitation: noise-estimate window assumes leading frames are noise-only, which isn't guaranteed by Phase 1's mixing (noise overlays the full utterance) — left as-is since exposing this classical failure mode is the baseline's purpose.
-- Ran successfully on full test split (299 pairs) → `results/baseline/*_enhanced.wav` (299 files, verified count).
+- Real results (test split, n=299, overall): SNR 1.84dB, STOI 0.592, PESQ 1.292 — improves raw-noisy SNR (+1.37dB) but *regresses* STOI/PESQ slightly vs. doing nothing (classical musical-noise failure mode, the exact thing this baseline exists to expose).
 
-## Loss (planned)
-- **L1 + multi-resolution STFT loss**.
+## Loss
+- **L1 + multi-resolution STFT loss** (`src/model/finetune.py::compute_loss`, `src/vendor/denoiser_patched/stft_loss.py`). 3 resolutions: `fft_sizes=[1024,2048,512]`, `hop_sizes=[120,240,50]`, `win_lengths=[600,1200,240]`. L1:STFT weight 1:1 for v1/v4/v5 (v2 tried 2.0 STFT weight, reverted — no measured benefit).
 
-## Evaluation — PHASE 2 COMPLETE, verified with real output
-- `src/eval/metrics.py`: `snr()`, `stoi_score()` (via `pystoi`), `pesq_score()` (via `pesq`, wideband mode — `eval.pesq_mode` in config).
-- `src/eval/evaluate.py`: scores `noisy` (raw floor) and `baseline` columns vs. clean test set, per-noise-category (gunshot/stationary/general) + overall breakdown. `finetuned` column wired but empty (n=0) until Phase 3. Writes `results/baseline_results.{json,csv}` (both verified present).
+## Evaluation — PHASE 2/4 COMPLETE, verified with real output
+- `src/eval/metrics.py`: `snr()`, `stoi_score()` (pystoi), `pesq_score()` (pesq, wideband).
+- `src/eval/evaluate.py`: scores noisy/baseline/finetuned columns, per-category + overall. `src/eval/evaluate_final.py`: focused v5-vs-baseline-vs-noisy demo comparison (Task 1) — **written, real output status not reconfirmed this session, treat as unresolved unless re-checked.**
+- `src/eval/diagnose_failures.py` / `diagnose_data_gaps.py`: the real diagnostic tooling behind the v1→v5 iteration story (see Phase 3 section below and `docs/phase3_training_deep_dive.md`).
 
-### Real results (test split, n=299)
-| column   | category   | n   | SNR(dB) | STOI  | PESQ  |
-|----------|-----------|-----|---------|-------|-------|
-| noisy    | gunshot   | 97  | -1.09   | 0.566 | 1.296 |
-| noisy    | stationary| 98  | 2.01    | 0.631 | 1.368 |
-| noisy    | general   | 104 | 0.47    | 0.596 | 1.260 |
-| noisy    | overall   | 299 | 0.47    | 0.598 | 1.307 |
-| baseline | gunshot   | 97  | -0.12   | 0.561 | 1.297 |
-| baseline | stationary| 98  | 3.22    | 0.626 | 1.309 |
-| baseline | general   | 104 | 2.36    | 0.588 | 1.271 |
-| baseline | overall   | 299 | 1.84    | 0.592 | 1.292 |
+## v1 → v5 fine-tuning iteration summary (full diagnostic story in `logs.md` and `docs/phase3_training_deep_dive.md`)
+- **v1** (epoch 7 best-val): flat LR 3e-5. Overall: SNR 8.671dB, STOI 0.6620, PESQ 1.7882.
+- **v1→v2 diagnosis:** `diagnose_failures.py` labeled 18/18 of v1's worst pairs "likely over-suppression" — drove every subsequent lever.
+- **v2** (epoch 7 best-val): warmup+cosine LR (peak 1.5e-4), STFT weight 2.0, 3x hard-mixture oversampling. Near-identical to v1 (SNR 8.564, STOI 0.6656, PESQ 1.7753) — ruled out optimizer/loss config as the bottleneck. `diagnose_data_gaps.py` ruled out gunshot-specific data scarcity (general low-SNR gap, not category-specific).
+- **v4** (epoch 11 best-val, ran to epoch 31): reverted v2's unproven levers; added curriculum learning (low-SNR/gunshot sampling ramp, first 40% of epochs) + silence-collapse penalty (computed, weight 0.05). Again near-identical (SNR 8.586, STOI 0.6631, PESQ 1.7718) — confirmed the bottleneck wasn't the training recipe at all.
+- **v5 — FINAL** (epoch 27 best-val, ran 42 epochs): root cause pinpointed as **static-dataset exhaustion** (all 3 prior versions plateaued identically despite different recipes because all trained on the same fixed 2,162-pair manifest). Fix: dynamic mixing (134 speakers/44.71hr, fresh mixtures per step) + `ReduceLROnPlateau` (factor 0.5, patience 5, min_lr 1e-5) replacing fixed cosine decay. **Best of all four versions on SNR/STOI, narrowly below v1 on PESQ**: SNR 8.750dB, STOI 0.6744, PESQ 1.7863.
+- **PS-target assessment (SNR>15dB, STOI>0.85, PESQ>2.5) — NEVER cleared, by any version.** Reported honestly: the real, consistent contribution is beating the classical baseline by a wide margin (SNR +6.91dB, STOI +0.082, PESQ +0.494, overall) across four methodologically-motivated iterations, not clearing the PS's absolute numeric bar. Δ-SNR (not absolute output SNR) is the honest reporting frame given the test set's -5 to 15dB input range — see `docs/phase3_training_deep_dive.md` Section 6 for the full mathematical justification.
 
-**Reading:** baseline lifts overall SNR (+1.37 dB) but STOI and PESQ both drop slightly vs. doing nothing — this is exactly the classical spectral-subtraction failure mode the baseline was built to expose (trades raw energy-ratio for perceptual/intelligibility quality via musical noise). Gunshot category is hardest and stays SNR-negative (transient noise breaks the "stationary noise fingerprint" assumption worst). This is the number fine-tuning (Phase 3) needs to beat, especially on STOI/PESQ, not just SNR.
-
-## MVP scope
-- End-to-end: mix defence-noise-corrupted speech → fine-tune dns48 → beat spectral-subtraction baseline on SNR/STOI/PESQ on a held-out speaker-disjoint test set.
-
-## Explicitly out of scope
-- No dashboard/UI (Streamlit/Gradio) — decided against.
-- No training from scratch.
-- No real-time streaming inference (batch/offline only, for now).
-- No mobile/edge deployment until Export phase (Phase 5), and only ONNX → CoreML/TFLite.
-
-## Environment / dependencies
-- **torch==2.14.0**, **torchaudio==2.11.0** — exact-pinned in `requirements.txt`. This is the correct current pairing: torchaudio's release cadence lags torch's, so no `2.14.x` torchaudio exists on PyPI. Verified directly against PyPI's JSON API, not assumed.
-- **denoiser==0.1.5** (unpinned in requirements — see below) has two confirmed runtime breakages against torch 2.14/torchaudio 2.11: `torchaudio.get_audio_backend()` removed, and `torch.stft()` requires `return_complex` now. Both patched locally.
-- **Do not import `denoiser.audio` or `denoiser.stft_loss` directly** — use `src/vendor/denoiser_patched/audio.py` (`Audioset`, `find_audio_files`, `get_info`) and `src/vendor/denoiser_patched/stft_loss.py` (`MultiResolutionSTFTLoss`) instead. Everything else from `denoiser` (model architecture, pretrained checkpoint loading, `convert_audio`/resample) is used as-is from the pip package. Full patch rationale/diffs in `src/vendor/denoiser_patched/README.md`.
-- **All audio file I/O goes through `soundfile`, not `torchaudio.load`/`torchaudio.save`.** torchaudio 2.11's I/O backend requires `torchcodec`, which requires native FFmpeg linking that failed to load on this machine (missing dylib on the linker search path) and was judged too fragile to depend on (this project may later move to Colab/Kaggle if MPS training hits limits). `torchaudio` stays installed for non-I/O ops; `torchcodec` is not a dependency.
-- MPS backend confirmed working (`torch.backends.mps.is_available()` → `True`) after all of the above.
-
-## Current phase
-**→ Latest status: v5 is the FINAL fine-tuned model (locked 2026-09-11, no further training
-planned). ONNX export (Phase 5a) is COMPLETE and VERIFIED CLEAN (zero export drift, isolated
-from a real crop confound) — Core ML/TFLite conversion has not started. Task 1 (focused demo
-comparison) is written but not yet run/reported. See "Phase 3c/4 iteration — v2, v4, v5",
-"Phase 5a — ONNX export", and "Task 1" sections below. Phases 1-4 below are the historical
-build-up to v1.**
-
-**Phase 1 complete — Data pipeline.** All datasets downloaded, `build_dataset.py` ran
-successfully end-to-end, outputs verified (wav counts, manifest schema, speaker-disjointness,
-audio format).
-
-**Phase 2 complete — Baseline + eval.** Spectral subtraction baseline ran on full test split
-(299/299 pairs), evaluate.py produced real SNR/STOI/PESQ numbers with per-category breakdown
-(see Evaluation section above), both results files verified present.
-
-**Phase 3a complete — dns48 model loading, verified.** `src/model/load.py` loads the pretrained
-dns48 checkpoint via `denoiser.pretrained.dns48()` (denoiser's own mechanism, pip package as-is —
-confirmed not to import either patched vendor file from Phase 0). Architecture verified against a
-locked spec in `configs/finetune.yaml['model']['expected']`: **18,867,937 params** (exact figure,
-not the rounded "~18.9M"), 5 encoder + 5 decoder layers, kernel_size=8, stride=4, 2-layer LSTM
-hidden 768 — all matched exactly, zero mismatches. MPS backend used (no CPU fallback needed).
-`src/model/verify_load.py` ran real inference on one real Phase 1 test-split file
-(`data/processed/test/test_000000_noisy.wav`, 4.8s @ 16kHz): output shape exactly matched input
-shape `(1, 76800)`, single-run inference time 615.12 ms on MPS (later confirmed to be cold-start
-per-shape MPS kernel compilation, not a real regression — warm timing is ~7-9ms/sec of audio).
-
-**Phase 3b complete — data loading + training-loop smoke test, verified with real values.**
-`src/model/dataset.py` (`NoisyCleanDataset`/`make_dataloader`) loads noisy/clean pairs from Phase 1
-manifests via `soundfile`, fixed-length random-crop (`training.segment_seconds=4.0`) to collate
-variable-duration clips into batches (`training.batch_size=2` for the smoke test).
-`src/model/finetune.py` wires forward -> L1+multi-resolution-STFT loss -> backward ->
-`optimizer.step()` (Adam, `training.learning_rate=3e-5` — 1/10th of a typical from-scratch rate,
-standard fine-tuning heuristic), with optional encoder-layer freezing implemented as a mechanism
-but defaulted off (`training.freeze_encoder_layers: 0`, a 3c decision). Ran one real smoke-test
-batch: **L1 loss 0.022368, STFT loss 0.175597, total 0.197965** — all non-zero/non-NaN/non-Inf,
-plausible for a pretrained-but-not-fine-tuned model on this project's real noisy/clean pairs.
-Gradient spot-check on 5 real params after `backward()` — all non-zero, confirming the loss is
-actually connected to the model. **This was also the first real test of the Phase 0 STFT loss
-patch (`return_complex` fix) against real batched audio via the soundfile I/O path** (not just
-Phase 0's synthetic sine tensors) — confirmed working, patched-module import path independently
-re-verified via `__file__` inspection (resolves to `src/vendor/denoiser_patched/stft_loss.py`).
-
-**Phase 3c COMPLETE — real training run finished, plateau-stopped, best checkpoint saved and
-verified.** Real train/val manifest counts confirmed: **2162 train pairs, 242 val pairs**.
-`configs/finetune.yaml['training_run']`: `batch_size: 8`, `max_epochs: 40` (hard ceiling,
-confirmed by user — deadline 2026-09-12, 2-2.5hr budget), `early_stopping: {min_delta: 0.001,
-patience_epochs: 5}`, `checkpoint_dir: "checkpoints"`, `results_csv:
-"results/finetune_training_log.csv"`. Full math/justification for each value in logs.md's Phase
-3c ceiling entry.
-
-**Real run result (user ran `python -m src.model.finetune --run` themselves):**
-- **Stopped early on plateau at epoch 12** of the 40-epoch ceiling — 5 consecutive epochs (8-12)
-  without val-loss improvement > `min_delta=0.001`.
-- **Best checkpoint: epoch 7**, `checkpoints/dns48_finetuned_best.pt` (226,473,933 bytes),
-  `val_total_loss=0.143079` (`val_l1=0.012954`, `val_stft=0.130126`) — verified by loading the
-  checkpoint directly and confirming its internal epoch/loss fields match the console log exactly.
-- **Wall-clock: ~26.5 min total** (~132s/epoch avg, faster than the ~3.64min/epoch pre-run
-  estimate — the 3.5x training-vs-inference multiplier assumption was conservative).
-- **Trend:** train loss decreased monotonically (0.1587→0.1413 over 12 epochs); val loss
-  plateaued/oscillated in a tight band from epoch 7 onward; train/val gap widened (epoch 1: ~0.011
-  → epoch 11: ~0.019) — an early-overfitting signature for this dataset size (2162 pairs), flagged
-  honestly, not smoothed over. This is the genuine plateau case (NOT ceiling-reached-without-
-  plateau) — must be reported as "plateaued at epoch 12, best val loss at epoch 7," never as
-  "ceiling reached" (it wasn't) or silently upgraded to "fully converged" (unresolved until
-  evaluated against real metrics).
-
-**Decision:** No hyperparameter tweaks made preemptively, per user instruction. Next step: Phase 4
-evaluation (below).
-
-**Phase 4 COMPLETE — real evaluation run, all three columns populated (v1).** `src/model/inference.py`
-loaded the fine-tuned checkpoint (weight-diff verified non-trivial: `torch.equal()` → False vs.
-pretrained, max abs diff 0.005874 on `encoder.0.0.weight`) and ran inference over all 299 test
-pairs → `results/finetuned/*_enhanced.wav`. `src/eval/evaluate.py` scored all three columns in one
-run, wrote `results/baseline_results.{json,csv}`.
-
-**PS-target assessment (SNR>15dB, STOI>0.85, PESQ>2.5) — NEVER cleared, by any version through v5**
-(see Phase 5 section below). v1's numbers superseded by v5 as the final model; full v1 numbers and
-v1-vs-baseline analysis are in `logs.md`'s Phase 4 entry, not repeated here.
-
-## Phase 3c/4 iteration — v2, v4, v5 fine-tuning runs (v5 is FINAL, locked 2026-09-11)
-
-Full rationale/config diffs for each version are in `configs/finetune.yaml`
-(`training_run`/`training_run_v4`/`training_run_v5` sections, heavily commented) and in
-`logs.md`'s "v2 through v5 fine-tuning iterations + FINAL model decision" entry. Summary:
-
-- **v1 → v2 diagnosis:** `diagnose_failures.py` labeled 18/18 of v1's worst test pairs
-  "likely over-suppression" (model erasing signal, not failing to clean it) — this diagnosis
-  drove every subsequent version's levers, not blind hyperparameter search.
-- **v2** (`checkpoints/dns48_finetuned_v2_best.pt`, epoch 7 best-val): LR warmup+cosine
-  (replacing v1's flat 3e-5), STFT loss weight 1.0→2.0, 3x hard-mixture (low-SNR) oversampling.
-  Result: near-identical to v1 on all metrics. `diagnose_data_gaps.py` follow-up ruled OUT
-  gunshot-specific data scarcity — the gap is general low-SNR capability, not category-specific.
-- **v4** (`checkpoints/dns48_finetuned_v4_best.pt`, epoch 11 best-val): reverted v2's unproven
-  STFT reweight and static oversampling; added epoch-aware **curriculum learning** (ramps
-  low-SNR and gunshot sampling weight over first 40% of epochs, multiplicative when both apply)
-  and a **silence-collapse penalty** (targets over-suppression directly, keyed off the noisy
-  input's own energy envelope). Result: again near-identical to v1/v2.
-- **v5 — FINAL MODEL** (`checkpoints/dns48_finetuned_v5_best.pt`, epoch 27 best-val,
-  `val_total_loss=0.13689`, the best of all four): **dynamic mixing** replaces the static
-  2162-pair manifest entirely (fresh mixtures drawn per step, uniform 1/3-per-category weights
-  to match v1-v4's natural balance, `steps_per_epoch=270` kept identical to v1-v4 for
-  comparability); **reactive LR** (`ReduceLROnPlateau`, factor 0.5, patience 5, min_lr 1e-5,
-  replacing fixed cosine decay). Silence-penalty term computed/logged every epoch but
-  `silence_penalty_enabled: false` — verified numerically this session (`train_total ≈
-  train_l1 + train_stft` to 8 decimals in `finetune_training_log_v5.csv`), i.e. measured but
-  NOT applied to gradients this run. Ran 42 epochs total.
-
-### Real results, all four versions, overall (test split, n=299; source: `results/baseline_results.csv`)
-| version | n   | SNR(dB) | STOI   | PESQ   |
-|---------|-----|---------|--------|--------|
-| v1      | 299 | 8.671   | 0.6620 | 1.7882 |
-| v2      | 299 | 8.564   | 0.6656 | 1.7753 |
-| v4      | 299 | 8.586   | 0.6631 | 1.7718 |
-| **v5**  | 299 | **8.750** | **0.6744** | **1.7863** |
-
-v5 is best or near-best on every metric (narrowly below v1 on PESQ specifically). Full
-per-category and per-SNR-bucket tables for all four versions are in `logs.md`, not repeated here.
-
-**FINAL DECISION (user, 2026-09-11): v5 is locked — no further training iterations planned.**
-PS numeric targets (SNR>15dB, STOI>0.85, PESQ>2.5) remain unreached by any version. This is
-reported as-is, not smoothed over: the project's real, consistent contribution is beating the
-classical spectral-subtraction baseline by a wide margin on every metric/category across four
-methodologically-motivated iterations — not clearing the PS's absolute numeric bar.
+**FINAL DECISION (user, 2026-09-11): v5 is locked. No further training iterations planned.**
 
 ## Phase 5a — ONNX export: COMPLETE, VERIFIED CLEAN
+- `src/export/to_onnx.py`: both fixed-length (`checkpoints/onnx/dns48_finetuned_v5.onnx`, opset 17) and dynamic-length exports succeeded — the flagged LSTM/dynamic-sequence-length export risk did not materialize.
+- Verification (isolated from a real crop confound via `verify_onnx_isolated.py`): **export drift is exactly 0.0000 (SNR/STOI/PESQ) to displayed precision.** The raw first-pass delta (SNR -0.2992dB etc.) was fully attributable to the fixed-length crop discarding real content on 61.5% of test clips (184/299 longer than 4s), not to the export itself.
 
-Scope: ONNX export of the v5 checkpoint, then Core ML/TFLite conversion (only if ONNX
-verification passes cleanly — do not proceed on a broken export). **ONNX step is done and
-passed; Core ML/TFLite conversion has not started.**
+## Phase 5b — Core ML conversion (iOS target): COMPLETE, all three precisions verified
+Real path included two genuine dead-ends, root-caused and fixed (full detail in `logs.md` and `docs/export_quantization_deep_dive.md`):
+1. `coremltools` 9.0 has no ONNX converter — switched to tracing the PyTorch checkpoint directly (`torch.jit.trace`).
+2. `mlprogram` (required for iOS15+ deployment target) defaults to fp16 compute precision — forced `compute_precision=FLOAT32` for the reference conversion so precision drift wasn't conflated with format drift.
+3. **Real bug, root-caused and fixed:** `Demucs`'s internal Python-int length arithmetic (`valid_length`, `downsample2`/`upsample2` parity checks) got traced as tensor ops by `torch.jit.trace`, crashing `coremltools`' MIL frontend (`TypeError: only 0-dimensional arrays...`). Fixed via `src/export/traceable_demucs.py::TraceableDemucs` — hardcodes all length-dependent arithmetic as precomputed Python constants, valid ONLY because this export targets one fixed input length (64,000 samples / 4.0s). Verified exact 0.0 max-abs-diff, both eager-wrapper-vs-original and traced-vs-eager, before trusting the fix.
 
-- `src/export/to_onnx.py`: exports `checkpoints/dns48_finetuned_v5_best.pt` to ONNX
-  (opset 17). Known risk (dns48's 2-layer LSTM, documented ONNX dynamic-sequence-length export
-  fragility) was flagged explicitly in-code before running — **did not materialize**: both the
-  fixed-length export (`checkpoints/onnx/dns48_finetuned_v5.onnx`, no `dynamic_axes`) AND the
-  dynamic-length export (`checkpoints/onnx/dynamic_dns48_finetuned_v5.onnx`) succeeded on the
-  real run, no silent fallback needed.
-- `src/export/verify_onnx.py`: ran the fixed-length ONNX model via `onnxruntime` over the full
-  299-pair test split. Real result: overall SNR 8.4508dB, STOI 0.6700, PESQ 1.7505 — delta vs.
-  v5's PyTorch numbers (SNR 8.75, STOI 0.674, PESQ 1.786): **SNR -0.2992dB, STOI -0.0040,
-  PESQ -0.0355**. This run's own logged warning flagged a real confound: test clips are
-  center-cropped/zero-padded to the 4.0s fixed export length before scoring, and **184/299 test
-  clips (61.5%) are longer than 4s** (confirmed by direct manifest inspection: min 1.445s, max
-  32.485s, mean 6.47s) — so this delta could not, by itself, be attributed to export drift vs.
-  crop-discarded content.
-- `src/export/verify_onnx_isolated.py` (new, written specifically to resolve that ambiguity):
-  feeds the IDENTICAL cropped waveform to both the ONNX graph and the PyTorch model (crop
-  variable held constant, only the runtime differs) and separately reports the crop effect
-  (pytorch-on-cropped-input vs. v5's original full-length PyTorch numbers).
+**All three precision artifacts verified against the same fixed-length-crop methodology (n=299), each isolated as its own variable:**
 
-### Real isolated result (test split, n=299)
-| comparison | SNR(dB) | STOI | PESQ |
-|---|---|---|---|
-| **export drift** (onnx vs. pytorch, identical cropped input) | **-0.0000** | **-0.0000** | **-0.0000** |
-| **crop effect** (pytorch-on-cropped-input vs. v5's full-length PyTorch eval) | -0.2992 | -0.0040 | -0.0355 |
+| artifact | size | SNR(dB) delta vs fp32 | STOI delta | PESQ delta | verdict |
+|---|---|---|---|---|---|
+| `dns48_finetuned_v5.mlpackage` (fp32) | 72MB | — (reference) | — | — | verified clean vs. ONNX (0.0000 delta) |
+| `dns48_finetuned_v5_fp16.mlpackage` | 54MB (~25% smaller) | -0.2472 | -0.0007 | -0.0624 | **fails** script's own small-delta threshold on SNR/PESQ (~5x/~3x over) — real, non-trivial cost |
+| `dns48_finetuned_v5_int8.mlpackage` (weights-only) | 18MB (exactly 4.00x smaller) | -0.0065 | -0.0002 | -0.0024 | **passes** threshold comfortably — rounding-level cost |
 
-**Conclusion: export drift is exactly zero (to displayed precision).** The entire gap
-`verify_onnx.py` first reported is fully explained by the fixed-length crop discarding real
-audio on the 61.5% of clips longer than 4s — not by any loss from the ONNX export itself. This
-satisfies the task's own stopping condition ("don't proceed to Core ML/TFLite on a broken
-export") — the export is clean, proceeding is supported.
+**Shipping decision:** FLOAT32 locked as the precision of record (defence-context safety margin — ~111x real-time headroom on M4 Pro makes fp16/int8's speed benefit unnecessary, so there's no reason to accept fp16's measured non-trivial cost). INT8 is verified clean and available as an option specifically for app-bundle-size reasons, independent of the safety-margin call — **this is the artifact actually shipped in the iOS app** (`ANCDemo/ANCDemo/Resources/dns48_finetuned_v5_int8.mlpackage`), since on-device bundle size is a real constraint that reasoning doesn't waive.
 
-- New `export:` config block in `configs/finetune.yaml` (`checkpoint_path`, `onnx_dir`,
-  `onnx_filename`, `fixed_length_seconds: 4.0` — matches `training.segment_seconds`,
-  `opset_version: 17`) — per rule 1, no magic numbers inline in export code.
-- `onnx`/`onnxruntime` now installed (user ran the real export/verify commands successfully) —
-  not yet added to `requirements.txt` as a formal pin (should be done before this is considered
-  fully closed out).
+## iOS demo app — `ANCDemo/` — COMPLETE, all four stages verified on a physical device
+Native SwiftUI app (bundle ID `com.arnav.anc.ANCDemo`, automatic signing, team `MGWJ67MC23`), shipping `dns48_finetuned_v5_int8.mlpackage`. Four stages, each verified before the next started:
+1. **Model load & verify** — confirmed the shipped model loads/runs correctly on-device; this is where the real cold/warm latency numbers were established.
+2. **Record → infer → play** — `AVAudioRecorder` (not `AVAudioEngine` — no real-time streaming need), reuses the exact model instance and fit-to-64000 logic from stage 1, Raw/Enhanced A/B playback.
+3. **Clean & Share / AirDrop** — native `UIActivityViewController` share sheet, surfaces AirDrop automatically.
+4. **UI polish** — status states, recording pulse animation, inference-time readout, playback-overlap fix.
 
-**Open decision, not made here:** whether the fixed-length-only (4.0s window) constraint is
-acceptable for the eventual on-device deployment shape, or whether the dynamic-length export
-(which also succeeded) should be carried forward instead to avoid chunking/padding longer audio
-at inference time — for the user to decide before Core ML/TFLite conversion begins.
+**Real on-device numbers:** cold (first call) ~274ms, warm (every call after) ~53-55ms — matches the Mac's per-shape MPS cold/warm pattern. **Design decision:** silent launch warmup (`ModelRunner.warmup()`, fire-and-forget background task at app launch) absorbs the cold cost before the user ever taps record, so the first real recording's displayed time reflects the warm number.
 
-## Task 1 — focused demo comparison (`evaluate_final.py`)
+Model input contract (locked, verified against export code, not assumed): 16kHz mono Float32, exactly 64,000 samples, tensor names `noisy_waveform`/`enhanced_waveform`.
 
-Code written (`src/eval/evaluate_final.py`, `results/final_comparison.csv` output target) but
-**real output not yet reported by the user** — status unresolved, not run/verified as of this
-snapshot.
+## Teaching documentation — `docs/` — COMPLETE
+Three long-form, beginner-to-master documents, grounded entirely in this repo's real numbers/config/code (no invented figures):
+- `docs/phase3_training_deep_dive.md` (~7,325 words) — fine-tuning fundamentals, training loop mechanics, loss function derivation, LR scheduling derivation, the full v1→v5 diagnostic journey (centerpiece), Δ-SNR reporting rationale, final results.
+- `docs/export_quantization_deep_dive.md` (~5,220 words) — ONNX fundamentals, the real `TraceableDemucs` tracing bug and fix, the full verification-chain isolation methodology, fp32/fp16/int8 from first principles, the real precision shipping decisions.
+- `docs/ios_app_brief.md` (~1,286 words, intentionally brief) — Core ML basics, Xcode/device pairing chain, four build stages, real latency numbers.
+
+## MVP scope
+- End-to-end: mix defence-noise-corrupted speech → fine-tune dns48 → beat spectral-subtraction baseline on SNR/STOI/PESQ on a held-out speaker-disjoint test set → export/quantize for on-device → working iOS demo. **All stages complete.**
+
+## Explicitly out of scope
+- No dashboard/UI (Streamlit/Gradio) in `src/` — decided against (a standalone judge-facing Streamlit dashboard outside `src/`, reading only `results/`, is in scope per CLAUDE.md rule 5's 2026-09-12 exception, but has not been built this session).
+- No training from scratch.
+- No real-time streaming inference (batch/offline record-then-process only).
+- TFLite conversion was never pursued once iOS/Core ML was confirmed as the actual target platform.
+
+## Environment / dependencies
+- **torch==2.14.0**, **torchaudio==2.11.0** — exact-pinned, confirmed correct current pairing (torchaudio's cadence lags torch's).
+- **denoiser==0.1.5** — two runtime breakages against this torch/torchaudio pairing, patched locally in `src/vendor/denoiser_patched/` (`audio.py`, `stft_loss.py`). Do not import `denoiser.audio`/`denoiser.stft_loss` directly.
+- **All audio file I/O goes through `soundfile`**, not `torchaudio.load`/`save` (torchcodec's native FFmpeg linking proved too fragile to depend on).
+- MPS backend confirmed working throughout.
+- **Still not formally pinned in `requirements.txt`:** `onnx`, `onnxruntime`, `coremltools` — all installed and working, used successfully across Phase 5a/5b, but the pin was never added. Open item, carried forward from earlier sessions.
+
+## Repo hygiene — RESOLVED this session
+A prior commit (`a54e699`, "prototype over") accidentally committed and pushed ~300MB of model binaries to `origin/main` — three Core ML `.mlpackage` bundles, two ONNX `.onnx.data` sidecars, and a duplicate `.mlpackage` bundled into the iOS app's Resources — because `.gitignore` covered `*.onnx`/`*.pt` but not `*.onnx.data` or `*.mlpackage` (a directory-based format those patterns never matched). Fixed via `git filter-repo` (installed this session), stripping all three paths from every commit in history (backed up first via `git clone --mirror`), followed by a `.gitignore` fix (`*.onnx.data`, `*.mlpackage/`, `checkpoints/coreml/`, `checkpoints/onnx/`, the app's Resources path) and a force-push of the rewritten history to `origin/main`. Verified clean on both local and remote after the fact — `.git` dropped from 300MB+ to 656KB, zero references to the stripped paths anywhere in history. **Flagged: any other clone/fork of this repo is now diverged and needs a fresh clone, not a pull.** Model files themselves remain present and usable on local disk — only untracked from git going forward.
 
 ## Open decisions
-- Whether v5's silence-penalty term should be re-enabled (it was computed but not applied to
-  gradients this run) — was pending user confirmation per the config's own comment; not resolved
-  in this session, not assumed either way.
-- Whether/how to close the remaining gap to the PS's absolute numeric targets is explicitly
-  NOT part of current scope — v5 is locked, no further training planned. Any future work on this
-  gap (architecture changes, more data, etc.) would be a new, separately-scoped effort.
-- Whether Core ML/TFLite conversion proceeds from the fixed-length ONNX export or the
-  dynamic-length one — both succeeded and are verified equally available; fixed-length avoids
-  any residual dynamic-axis runtime risk, dynamic-length avoids a chunk/pad step at inference
-  time. Not decided here.
-- `onnx`/`onnxruntime` are installed and working but not yet formally pinned in
-  `requirements.txt` — should be added before Phase 5a is considered fully closed out.
+- Whether v5's silence-penalty term should be re-enabled (computed but not applied to gradients in the v5 run) — still not resolved, not assumed either way.
+- Whether/how to close the remaining gap to the PS's absolute numeric targets (SNR>15dB/STOI>0.85/PESQ>2.5) is explicitly NOT current scope — v5 is locked; any future work here would be a new, separately-scoped effort.
+- `onnx`/`onnxruntime`/`coremltools` pinning in `requirements.txt` — still open.
+- Task 1 (`evaluate_final.py` real output) — status not reconfirmed this session; treat as unresolved unless re-checked against real console output.
+- Whether a standalone judge-facing Streamlit dashboard (in-scope per CLAUDE.md's 2026-09-12 exception) gets built — not started, not requested yet this session.

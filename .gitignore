@@ -8,6 +8,7 @@ data/processed/
 checkpoints/coreml/
 checkpoints/onnx/
 ANCDemo/ANCDemo/Resources/*.mlpackage/
+**/xcuserdata/
 __pycache__/
 .venv/
 *.pyc
