@@ -10,7 +10,7 @@ Non-negotiable constraints for any coding agent (including Claude Code) working 
 
 4. **`context.md` is a snapshot, not a log.** Overwrite it fully each session to reflect current state (model, data, phase, decisions). Do not accumulate history there — that's what `logs.md` is for.
 
-5. **No dashboard/UI code.** Streamlit, Gradio, or any web UI is explicitly out of scope. Decided against — do not build one even if it seems convenient for demoing results.
+5. **No dashboard/UI code as part of the pipeline.** `src/` stays free of Streamlit/Gradio/web-UI code — the pipeline itself is not a dashboarded product. Exception (decided 2026-09-12): a standalone Streamlit results dashboard for judge presentation is in scope, kept fully outside `src/` (e.g. `dashboard/`), reading only already-computed files under `results/` — it does not run training/inference/eval itself.
 
 6. **No training from scratch.** The dns48 checkpoint (Facebook Research Denoiser) is fine-tuned via transfer learning only. Do not initialize or train a model from random weights.
 

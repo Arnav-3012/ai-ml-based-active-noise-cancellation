@@ -87,6 +87,50 @@ def download_librispeech(cfg: dict) -> None:
           f"(target range was {lo}-{hi}).")
 
 
+def check_librispeech_train_clean_100(cfg: dict) -> bool:
+    """train-clean-100 is checked at the RAW extraction level (any flac files
+    present under its own subdirectory), separate from dev-clean's check --
+    the two subsets are never mixed in data/raw/, so build_dynamic_pool.py
+    (TASK 1's manifest-building step) can index each independently.
+    """
+    target_dir = RAW_DIR / "librispeech_train_clean_100"
+    flac_files = list(target_dir.rglob("*.flac"))
+    if len(flac_files) > 0:
+        print(f"[librispeech_train_clean_100] already present: {len(flac_files)} utterances "
+              f"found (full raw extraction, not yet subsetted). Skipping download.")
+        return True
+    return False
+
+
+def download_librispeech_train_clean_100(cfg: dict) -> None:
+    """Downloads the FULL train-clean-100 tarball (~25GB) -- the config's
+    target_hours/target_speakers_min subset selection happens later, in
+    src/data/build_dynamic_pool.py (TASK 1's manifest step), not here. This
+    function's only job is getting the raw flac files onto disk; keeping the
+    subset-selection logic in one place (build_dynamic_pool.py) means a
+    config change to target_hours never requires re-downloading.
+    """
+    if check_librispeech_train_clean_100(cfg):
+        return
+    target_dir = RAW_DIR / "librispeech_train_clean_100"
+    url = cfg["dataset"]["librispeech_train_clean_100"]["url"]
+    archive_path = target_dir / "train-clean-100.tar.gz"
+
+    print("[librispeech_train_clean_100] downloading full train-clean-100 (~25GB, "
+          "large download -- subset selection happens later in build_dynamic_pool.py).")
+    _download_with_progress(url, archive_path)
+    print("[librispeech_train_clean_100] extracting...")
+    with tarfile.open(archive_path, "r:gz") as tf:
+        tf.extractall(target_dir)
+    archive_path.unlink()
+
+    flac_files = list(target_dir.rglob("*.flac"))
+    speakers = {f.parts[-3] for f in flac_files}
+    print(f"[librispeech_train_clean_100] done: {len(flac_files)} utterances extracted, "
+          f"{len(speakers)} distinct speakers (full raw set -- subset selection is a "
+          f"separate step, run src/data/build_dynamic_pool.py next).")
+
+
 def check_musan(cfg: dict) -> bool:
     target_dir = RAW_DIR / "musan" / "noise"
     wav_files = list(target_dir.rglob("*.wav")) if target_dir.exists() else []
@@ -264,6 +308,7 @@ def main() -> None:
     RAW_DIR.mkdir(parents=True, exist_ok=True)
 
     download_librispeech(cfg)
+    download_librispeech_train_clean_100(cfg)
     download_musan(cfg)
     download_urbansound8k(cfg)
     download_gunshots(cfg)  # may only print manual instructions

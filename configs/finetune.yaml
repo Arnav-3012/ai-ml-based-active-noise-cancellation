@@ -14,6 +14,38 @@ dataset:
     url: "https://www.openslr.org/resources/12/dev-clean.tar.gz"
     target_utterances_min: 2000
     target_utterances_max: 2500
+  # --- v5 TASK 1: expanded clean-speech pool (train-clean-100), dynamic-mixing source ---
+  # dev-clean (above) stays as-is -- the v1/v2/v4 speaker-disjoint split and its
+  # val/test speaker sets are untouched, and dev-clean's train speakers remain
+  # part of the pool as before. train-clean-100 is a SEPARATE, additional pool
+  # used only for v5's dynamic mixing training draw (never for val/test).
+  librispeech_train_clean_100:
+    subset: "train-clean-100"
+    url: "https://www.openslr.org/resources/12/train-clean-100.tar.gz"
+    # ~25GB tarball, ~251 speakers, ~100.6hr total in the full official set.
+    # We keep a SUBSET targeting ~20-25hr / 100+ distinct speakers (per task
+    # instruction), not the full corpus -- full download+build time isn't
+    # needed for a still-large diversity gain, and dynamic mixing only needs
+    # enough distinct utterances to make on-the-fly recombination genuinely
+    # non-repeating across ~16200 v5 training steps (see training_run_v5
+    # below), not the full 100hr.
+    # Selection mechanism (build_dynamic_pool.py): sort speakers by total
+    # utterance duration ascending is NOT used (would bias toward speakers
+    # with short/few utterances); instead speakers are shuffled (seeded,
+    # `seed` above) and taken in full (all their utterances) one at a time
+    # until the running total duration crosses target_hours -- keeps whole
+    # speakers intact (no partial-speaker inclusion) and gives an
+    # approximately random, unbiased speaker sample.
+    # v5 retry: 22.5hr yielded only 57 speakers (below target_speakers_min)
+    # -- shuffled whole-speaker selection filled the hour budget with fewer,
+    # longer-speaking speakers before reaching 100+. Time is not a
+    # constraint, so raised to 40hr to prioritize speaker count/diversity
+    # over minimizing total hours -- same selection mechanism (seeded
+    # shuffle, whole speakers only, stop once cumulative duration crosses
+    # target_hours), just a larger budget so more speakers get pulled in
+    # before the budget fills.
+    target_hours: 40.0
+    target_speakers_min: 100
   musan:
     url: "https://www.openslr.org/resources/17/musan.tar.gz"
     category: "noise"  # use all clips under musan/noise/**
@@ -99,3 +131,634 @@ baseline:
 # --- Phase 2: evaluation ---
 eval:
   pesq_mode: "wb"   # wideband PESQ (ITU-T P.862.2), correct mode for 16kHz speech
+  # Phase 4 v2: input-SNR bucket edges (dB), matching the -5..15dB range
+  # mixing.snr_db_min/max already spans. Each bucket is [low, high) except
+  # the last, which is [low, high] to include the max-SNR pairs exactly at
+  # mixing.snr_db_max. Locked Tier-1 deliverable buckets per explicit request.
+  snr_buckets_db: [-5, 0, 5, 10, 15]
+  # How many worst-scoring test pairs to list per metric (PESQ, STOI) for
+  # the finetuned_v2 column, per explicit request ("10 worst-scoring").
+  worst_pairs_count: 10
+
+# --- Phase 5a: ONNX export ---
+export:
+  checkpoint_path: "checkpoints/dns48_finetuned_v5_best.pt"
+  onnx_dir: "checkpoints/onnx"
+  onnx_filename: "dns48_finetuned_v5.onnx"
+  # dns48 has a 2-layer LSTM (denoiser.demucs.Demucs) -- LSTMs have a known
+  # history of ONNX dynamic-axis export issues. Export with a FIXED input
+  # length first (safer, known-working path); dynamic-length export is
+  # attempted second and reported (not silently skipped) if it fails.
+  # 4.0s matches training.segment_seconds so the traced shape is one the
+  # model has actually seen fixed-length inputs at, not an arbitrary choice.
+  fixed_length_seconds: 4.0
+  opset_version: 17
+
+# --- Phase 5b: Core ML conversion (iOS target) ---
+coreml:
+  # Conversion source is the PyTorch v5 checkpoint directly (export.checkpoint_path),
+  # traced via torch.jit.trace -- NOT the ONNX export. The installed
+  # coremltools version has no built-in ONNX converter (`ct.convert()` only
+  # auto-detects "pytorch"/"tensorflow"/"milinternal" sources; confirmed via
+  # a real ValueError on an actual run, not assumed upfront). Phase 5a's
+  # ONNX export/verification remains valid for its own purposes -- it's
+  # just not this step's input. Uses export.fixed_length_seconds as the
+  # traced input length, same fixed-length constraint as the ONNX path
+  # (deployment will need to chunk/pad audio to this window).
+  mlpackage_dir: "checkpoints/coreml"
+  mlpackage_filename: "dns48_finetuned_v5.mlpackage"
+  # "mlprogram" (ML Program) is coremltools' current default/preferred backend
+  # and REQUIRED for minimum_deployment_target iOS15+ -- confirmed via a real
+  # ValueError on an actual run ("If minimum deployment target is iOS15... or
+  # higher, then 'convert_to' cannot be neuralnetwork. It must be 'mlprogram'").
+  # The earlier assumption that legacy "neuralnetwork" has more mature LSTM op
+  # coverage was based on older coremltools history and does not hold here --
+  # mlprogram is where current LSTM-op development is focused, and iOS15+ is
+  # the actual constraint driving this choice, not a backend preference.
+  convert_to: "mlprogram"
+  minimum_deployment_target: "iOS15"
+  # fp32 is the default/primary artifact (mlpackage_filename above). This
+  # separate filename is for the fp16-compute-precision isolation measurement
+  # (Phase 5b follow-up) -- same wrapper, same conversion, ONLY compute_precision
+  # differs, so any delta vs. the fp32 baseline is attributable to precision
+  # alone, not conversion format (already verified zero) or quantization (not
+  # part of this step).
+  mlpackage_filename_fp16: "dns48_finetuned_v5_fp16.mlpackage"
+  # INT8 weights-only post-training quantization (Phase 5b follow-up),
+  # applied to the ALREADY-VERIFIED fp32 .mlpackage via
+  # coremltools.optimize.coreml.linear_quantize_weights -- not requantized
+  # from ONNX or re-traced. Weights-only: activations stay fp32/fp16 at
+  # runtime (linear_quantize_activations is a separate, uncalled API in
+  # this coremltools version -- not part of this artifact). Kept as a
+  # separate file; fp32 and fp16 artifacts above are untouched.
+  mlpackage_filename_int8: "dns48_finetuned_v5_int8.mlpackage"
+  # dtype passed to linear_quantize_weights -- "int8" is the config's single
+  # source of truth for the quantization bit-width (no magic literal in code).
+  int8_quantize_dtype: "int8"
+
+# --- Phase 3a: model loading ---
+model:
+  name: "dns48"
+  # Locked architecture spec (Facebook Research Denoiser dns48 checkpoint),
+  # used only to sanity-check the loaded model against expectations -- these
+  # are NOT passed into the constructor (pretrained.dns48() builds the model
+  # itself from its own hardcoded architecture to match the checkpoint), they
+  # exist purely so load.py can flag a mismatch rather than assume the
+  # checkpoint matches the spec silently.
+  expected:
+    # 18867937 verified directly by instantiating denoiser.demucs.Demucs
+    # with dns48's hyperparameters (chin=1, chout=1, hidden=48, depth=5,
+    # kernel_size=8, stride=4, causal=True, resample=4) and summing
+    # p.numel() -- NOT the commonly-quoted "~18.9M" rounded figure.
+    total_params: 18867937
+    encoder_layers: 5
+    decoder_layers: 5
+    kernel_size: 8
+    stride: 4
+    chin: 48
+    chout: 768
+    lstm_layers: 2
+    lstm_hidden: 768
+
+# --- Phase 3b: data loading + training loop smoke test ---
+training:
+  # Fixed-length random-crop segment for training, in seconds. Manifest
+  # clips have variable duration (verified in Phase 3a follow-up: 3.8s to
+  # 32.3s across test-split files alone) -- a DataLoader batch_size > 1
+  # needs same-length tensors to collate, so each __getitem__ crops (or
+  # pads, if the clip is shorter) to this fixed length. Kept modest for
+  # smoke-test iteration speed; long enough that the model still receives
+  # a meaningful window.
+  segment_seconds: 4.0
+  # Smoke-test batch size -- deliberately tiny (per 3b task scope: 1-2
+  # batches, 1 gradient step, not real training). Larger batch sizes for
+  # 3c belong here too, when that phase starts.
+  batch_size: 2
+  num_workers: 0
+  # Adam LR: dns48 ships pretrained, so this is fine-tuning, not
+  # from-scratch training. A typical from-scratch speech-enhancement LR
+  # with Adam is ~3e-4 (denoiser's own paper/repo default); using 1/10th
+  # of that (3e-5) is the standard fine-tuning heuristic -- small enough
+  # to nudge pretrained weights toward the new noise distribution
+  # (gunshot/battlefield) without catastrophically forgetting what dns48
+  # already learned on its original training distribution.
+  learning_rate: 3.0e-5
+  # L1 + multi-resolution STFT loss weighting (locked in context.md
+  # "Loss (planned)" -- L1 + multi-resolution STFT). Weights kept equal
+  # (1.0 each) for the 3b smoke test; rebalancing is a 3c tuning decision,
+  # not assumed here.
+  loss_weights:
+    l1: 1.0
+    stft: 1.0
+  # Optional early-layer freezing -- mechanism implemented in finetune.py,
+  # defaulted OFF. Locked as "optional" in project decisions; whether to
+  # actually freeze early encoder layers is a 3c decision, not 3b's.
+  freeze_encoder_layers: 0
+
+# --- Phase 3c: real training run (epochs, early stopping, checkpointing) ---
+training_run:
+  # Real training batch size -- replaces 3b's smoke-test batch_size=2 above
+  # for the actual run (that config key stays 2 and is untouched; this run
+  # reads batch_size from here instead). Recommended and confirmed with the
+  # user 2026-09-11: dns48 is small (~18.9M params, ~225MB fixed weights +
+  # Adam optimizer state), so 24GB unified memory is not the binding
+  # constraint at this model scale -- batch=8 gives meaningfully more
+  # stable gradients than batch=2 for a low-LR (3e-5) fine-tune, without
+  # batch=16's higher first-run OOM/swap risk on MPS's less mature memory
+  # manager than CUDA's.
+  batch_size: 8
+  # v2 (2026-09-11): recalculated ceiling given the same measured
+  # ~130s/epoch (v1's real average, dataset size unchanged by oversampling
+  # -- WeightedRandomSampler draws the same number of samples/epoch, just
+  # with different pair frequencies) and the new patience_epochs=10 below.
+  # v1 plateaued at epoch 12 (5-epoch patience) with best val loss still at
+  # epoch 7 -- val loss was still fluctuating without a clearly exhausted
+  # plateau. Worst case for patience=10 is 10 extra flat epochs before
+  # stopping, so the ceiling needs enough headroom that patience -- not the
+  # ceiling -- is what stops the run. Budget: user has explicitly accepted
+  # a longer run this time. 60 epochs * 130s/epoch = 7800s = 130min ≈
+  # 2.17hr -- close to double v1's 40-epoch/2.4hr ceiling's epoch count,
+  # giving real room for the LR schedule's cosine decay to actually
+  # complete a full cycle (warmup+decay shaped around max_epochs, see
+  # training_run.lr_schedule below) rather than being cut off mid-decay.
+  max_epochs: 60
+  # Plateau-based early stopping: stop if best val loss (weighted total,
+  # matching loss_weights above) hasn't improved by more than
+  # min_delta over the last patience_epochs epochs.
+  # v2 (2026-09-11): patience raised 5 -> 10 because v1's val loss was
+  # still improving/fluctuating at its stop point (epoch 12, best at
+  # epoch 7) -- 5 epochs wasn't enough to distinguish "genuine plateau"
+  # from "temporary flat stretch on a still-improving trajectory". 10
+  # epochs at ~130s/epoch is ~22min of patience runway, affordable within
+  # the new 60-epoch/~2.17hr ceiling. min_delta left unchanged (0.001,
+  # still ~0.5% of the ~0.198 reference loss scale from 3b) -- v1's issue
+  # was patience length, not threshold tightness.
+  early_stopping:
+    min_delta: 0.001
+    patience_epochs: 10
+  # Checkpointing: only the best-val-loss checkpoint is kept (not every
+  # epoch, not just the last) -- overwritten in place each time val loss
+  # improves, per task instruction to save at best-val-loss-so-far.
+  # v2 (2026-09-11): saved under a new filename (dns48_finetuned_v2_best.pt)
+  # so the v1 checkpoint (dns48_finetuned_best.pt) is never overwritten --
+  # kept for comparison/fallback per explicit instruction.
+  checkpoint_dir: "checkpoints"
+  checkpoint_filename: "dns48_finetuned_v2_best.pt"
+  results_csv: "results/finetune_training_log_v2.csv"
+
+  # --- v2 lever 1: LR schedule (warmup + decay), replaces v1's flat LR ---
+  # v1 used a flat training.learning_rate=3e-5 for all 12 epochs. v2
+  # replaces this with warmup+decay so the model can move further from
+  # the pretrained weights during the productive middle of training while
+  # still starting and ending gently.
+  lr_schedule:
+    # Peak LR reached at the end of warmup. Chosen at 1.5e-4 -- 5x v1's
+    # flat 3e-5, i.e. roughly half of the ~3e-4 from-scratch Adam LR
+    # denoiser's own paper/repo uses (v1's config comment cites this same
+    # from-scratch reference point). Reasoning: v1's flat 3e-5 (1/10th of
+    # from-scratch) was conservative and plateaued with val loss still
+    # only slightly ahead of train loss diverging (mild overfitting, not
+    # underfitting) -- so there is headroom to push harder. But dns48 is
+    # pretrained, not random-init: going all the way to the from-scratch
+    # rate (3e-4) risks catastrophically forgetting the general speech
+    # priors already learned (the whole point of transfer learning over
+    # training from scratch, a locked project decision). 1.5e-4 sits at
+    # the midpoint of the requested 1e-4-3e-4 range -- meaningful movement
+    # (5x v1) without matching the from-scratch magnitude.
+    peak_lr: 1.5e-4
+    # Floor LR at the end of cosine decay -- kept well above zero so the
+    # model keeps learning (not frozen) through the final epochs, but low
+    # enough to fine-tune-settle rather than keep taking large steps.
+    # Set to v1's original flat LR (3e-5) -- a natural, already-justified
+    # floor rather than an arbitrary new number.
+    min_lr: 3.0e-5
+    # Warmup ratio: fraction of total steps spent linearly ramping
+    # 0 -> peak_lr. 5% requested explicitly; with max_epochs=60 and
+    # steps_per_epoch=2162//8=270 (unchanged by oversampling -- see
+    # max_epochs comment), total_steps=16200, so warmup covers the first
+    # ~810 steps (~3 epochs) -- long enough to avoid an early destructive
+    # jump straight to peak_lr on pretrained weights, short enough that
+    # most of the run is spent in productive decay, not ramping.
+    warmup_ratio: 0.05
+    # Cosine decay from peak_lr to min_lr over the remaining 95% of steps,
+    # per task's explicit menu (warmup + cosine OR linear decay) -- cosine
+    # chosen because its decay rate is gentlest right after peak (matches
+    # the intuition of not yanking the LR down right when the model is
+    # moving fastest) and steepens later, versus linear's constant slope.
+    schedule_type: "cosine"
+
+  # --- v2 lever 4: optional partial encoder freezing (toggleable, OFF by default) ---
+  # Separate from training.freeze_encoder_layers (which stays 0, the 3b/3c
+  # smoke-test/v1 key, untouched) -- this is v2's own toggle so v1's
+  # smoke_test_train() and train() behavior are never affected by this
+  # flag. Proposed N=2 (of 5 encoder layers) if enabled: freezes only the
+  # earliest, most generic low-level feature extractors (closest to raw
+  # waveform), leaving the LSTM bottleneck + decoder + the 3 later
+  # (higher-level, more domain-specific) encoder layers free to move
+  # aggressively under the new higher peak_lr -- the early layers are the
+  # ones most likely to hold general, transferable waveform features
+  # that a higher LR risks destabilizing for little gain. Defaulted OFF
+  # (false) per explicit instruction -- "don't hardcode it on", this is
+  # for a deliberate A/B, not a default behavior change.
+  freeze_encoder_layers_v2:
+    enabled: false
+    n_layers: 2
+
+  # --- v2 lever 5: oversampling harder (lower-SNR) mixtures, TRAIN ONLY ---
+  # Mechanism: torch.utils.data.WeightedRandomSampler over the train
+  # dataset only, weighting each pair by its manifest snr_db (already
+  # present per-pair from Phase 1, no new data/labels needed). Pairs with
+  # snr_db in [-5, 5) (the harder half of the -5..15dB range) get
+  # oversample_factor x the sampling weight of pairs with snr_db in
+  # [5, 15]. val/test dataloaders are explicitly UNCHANGED/uniform --
+  # make_dataloader() only applies this sampler when split == "train" AND
+  # this is enabled, so val/test always keep their true representative
+  # -5..15dB distribution for honest evaluation (per explicit instruction).
+  # oversample_factor=3.0 proposed: strong enough to meaningfully shift
+  # training exposure toward the hardest cases (gunshot/low-SNR is v1's
+  # worst-performing category per Phase 4 results) without making the
+  # sampler so extreme that the model overfits to a narrow low-SNR slice
+  # and regresses on the higher-SNR half of the real test distribution.
+  oversample_hard_mixtures:
+    enabled: true
+    snr_hard_threshold_db: 5
+    oversample_factor: 3.0
+
+# --- v2 lever 2: loss reweighting (multi-resolution STFT vs L1) ---
+# v1 (training.loss_weights above) used implicit 1:1 (l1=1.0, stft=1.0).
+# v2 overrides both weights when training_run.loss_weights_v2 is present
+# (train() reads this instead of training.loss_weights when running the
+# v2 script) -- kept as a SEPARATE key so v1's smoke_test_train() and any
+# reproduction of the v1 run are byte-for-byte unaffected.
+# Proposed: l1=1.0 (unchanged anchor), stft=2.0 (2x v1's implicit stft
+# weight). Reasoning: multi-resolution STFT loss operates directly on
+# spectral magnitude/structure across multiple time-frequency resolutions,
+# which correlates much more directly with STOI (an intelligibility
+# measure computed from short-time spectral envelope correlation) and
+# PESQ (a perceptual measure built on auditory-spectral distortion) than
+# raw waveform L1, which penalizes sample-wise amplitude error without
+# any awareness of spectral/perceptual structure. Since STOI>0.85 and
+# PESQ>2.5 are this run's literal chased targets (not SNR), shifting
+# relative loss weight toward the STFT term is a direct, targeted lever
+# for exactly those two metrics.
+loss_weights_v2:
+  l1: 1.0
+  stft: 2.0
+
+# --- v4: curriculum training + silence-collapse penalty ---
+# Diagnosis (v1 vs v2 vs data-gap analysis, all confirmed with real numbers
+# before this section was written -- see logs.md's v4 entry):
+#   - v1 and v2 land at ~identical STOI/PESQ (~0.66/1.78) despite different
+#     LR/loss/oversampling configs -- neither lever from v2 moved the needle.
+#   - Failure mode is OVER-suppression (near-silence on speech), confirmed
+#     both automatically (diagnose_failures.py) and by ear, and confirmed
+#     PRE-EXISTING in v1 too (not caused by v2's oversampling/STFT changes).
+#   - NOT a data volume/balance issue: gunshot=32.4%, stationary=34.7%,
+#     general=32.8% of train pairs -- balanced (diagnose_data_gaps.py).
+#   - Failure is concentrated in the (gunshot x -5..0dB SNR) cell specifically
+#     (results/snr_bucket_results.csv + per-category breakdown: this cell's
+#     STOI is the single worst of any category/SNR combination, while
+#     gunshot is actually the BEST category at 5-15dB SNR) -- a steep,
+#     category-specific SNR-dependency, not uniform weakness across the board.
+# Hypothesis: the model has learned "when acoustically confused (very low
+# SNR, transient/impulsive noise), suppress toward silence" as a local
+# optimum -- plausibly because it faces its hardest examples (lowest SNR,
+# most impulsive) from early training, before it has built reliable general
+# speech-preservation behavior on the easier majority of cases.
+# Two combined, complementary interventions, motivated directly by the above
+# (not a broad hyperparameter sweep): curriculum training (ramp difficulty
+# so hard/gunshot/low-SNR exposure comes after an easy-case foundation is
+# built) + a silence-collapse penalty (directly penalizes the exact failure
+# mode observed, keyed off the noisy input's own energy so it only fires
+# where "something was probably there").
+training_run_v4:
+  batch_size: 8
+  checkpoint_dir: "checkpoints"
+  checkpoint_filename: "dns48_finetuned_v4_best.pt"
+  results_csv: "results/finetune_training_log_v4.csv"
+
+  # Epoch ceiling: v1 (40-epoch ceiling, patience=5) plateaued at epoch 12,
+  # best val at epoch 7. v2 (60-epoch ceiling, patience=10) landed at
+  # near-identical STOI/PESQ to v1 -- i.e. even with 5x the patience runway,
+  # neither run needed anywhere close to its ceiling to reach its eventual
+  # plateau. That headroom was real but unused BECAUSE v1/v2 trained on a
+  # static distribution the whole time -- there was nothing left to learn
+  # once the model settled into its (now-diagnosed) suppress-when-confused
+  # local optimum.
+  # Curriculum training changes this: the training DISTRIBUTION itself
+  # shifts over the run (see curriculum.ramp_epoch_fraction below), so the
+  # model faces a materially different, harder mixture composition in the
+  # back half of training than in the front half. This means a genuine
+  # second phase of learning/re-adjustment is expected AFTER the ramp
+  # completes, not just noise around an already-found optimum -- so the
+  # ceiling must give that second phase real room, not just extend the same
+  # kind of budget v1/v2 already had unused surplus of.
+  # Concretely: ramp finishes at 40% of max_epochs (see curriculum section).
+  # For the post-ramp full-difficulty phase to plausibly reach its own
+  # plateau (not just get a few epochs before the ceiling), it needs a
+  # budget comparable to or larger than v1/v2's own full plateau timelines
+  # (7-12 epochs to best-val, up to ~60 to rule out slow late improvement).
+  # 100 epochs -> ramp ends at epoch 40 (curriculum section), leaving 60
+  # full-difficulty epochs after the ramp -- enough for a full independent
+  # plateau cycle post-ramp, not a truncated tail.
+  # Wall-clock: v1/v2 measured ~130-140s/epoch on this hardware/batch_size;
+  # 100 epochs x ~140s = 14000s ~= 3.9hr worst case (full ceiling, no
+  # plateau) -- within the user's explicit "time is not a constraint for
+  # this run" instruction for this task.
+  max_epochs: 100
+
+  # Patience: must be long enough not to false-trigger on the curriculum's
+  # OWN loss fluctuation (each epoch's train-set difficulty distribution is
+  # slightly different from the last during the ramp, epochs 1-40, which
+  # will show as legitimate non-monotonic val-loss movement that is NOT a
+  # plateau) and must give room to detect a genuine post-ramp plateau rather
+  # than stopping while the model is still adjusting to full difficulty.
+  # v2 used patience=10 at a 60-epoch ceiling (~17% of ceiling). Scaling
+  # similarly here would be ~17 epochs; rounded up to 15->20 range and set
+  # to 20 to explicitly cover the case where a plateau-like flat stretch
+  # appears mid-ramp (a false plateau signal, since difficulty is still
+  # increasing) -- patience=20 at ~140s/epoch is ~47min of runway, which
+  # is affordable given "time is not a constraint."
+  early_stopping:
+    min_delta: 0.001
+    patience_epochs: 20
+
+  # --- Curriculum: epoch-dependent train-sampling schedule ---
+  # Replaces v2's FIXED oversample_hard_mixtures (training_run.
+  # oversample_hard_mixtures, untouched/still present above for v1/v2
+  # reproducibility) with an EPOCH-AWARE version. Both target the same
+  # underlying mechanism (WeightedRandomSampler over train pairs, built
+  # fresh each epoch by src/model/dataset.py's
+  # make_curriculum_sampler()) but v2's was a single static 3x weight for
+  # the whole run; this ramps the weight up over time instead.
+  #
+  # Two independent axes are both ramped by the SAME schedule progress
+  # value (see shape below), each contributing its own multiplicative
+  # weight, combined per-pair (weights multiply when a pair is BOTH
+  # low-SNR AND gunshot, which is exactly the diagnosed worst cell):
+  #   snr_weight(pair)      = interpolate(start=1.0, end=snr_end_weight)
+  #                            if pair.snr_db < snr_hard_threshold_db else 1.0
+  #   category_weight(pair) = interpolate(start=1.0, end=category_end_weight)
+  #                            if pair.noise_category == "gunshot" else 1.0
+  #   pair_weight = snr_weight * category_weight
+  #
+  # Schedule shape: LINEAR ramp over the first `ramp_epoch_fraction` of
+  # max_epochs, then held at the end weights for the remainder ("full
+  # difficulty thereafter"). Chosen over e.g. a step function or exponential
+  # ramp because: (a) a step function (easy-only then suddenly full-hard)
+  # reintroduces exactly the "sudden immersion in confusing examples" shape
+  # implicated by the current hypothesis, just delayed instead of removed;
+  # (b) linear is the simplest schedule that gives a smooth, monotonic,
+  # fully-config-driven transition with no extra shape hyperparameter to
+  # justify (e.g. exponential/cosine ramps would need an additional rate
+  # constant with no evidence here to set it from).
+  # ramp_epoch_fraction=0.4 (40%) chosen so the ramp completes well before
+  # historical plateau points (v1 best-val epoch 7 of 40 = 17.5% of budget;
+  # v2 never clearly plateaued by 60 epochs) WHILE leaving the majority
+  # (60%) of the much larger v4 budget for the model to consolidate at full
+  # realistic difficulty -- if the ramp were slower (e.g. 70-80%), most of
+  # the run would still be in transition and the post-ramp "settle at real
+  # distribution" phase (the actual point of curriculum learning: end on
+  # the real distribution, not a permanently easier one) would be too short
+  # to trust the final checkpoint's behavior on hard cases.
+  # val/test dataloaders are explicitly NEVER curriculum-weighted -- see
+  # make_dataloader()/make_curriculum_sampler() in src/model/dataset.py,
+  # which only ever builds this sampler for split == "train". This mirrors
+  # v2's existing val/test-stays-uniform guarantee exactly, same standard.
+  curriculum:
+    enabled: true
+    ramp_epoch_fraction: 0.4
+    snr_hard_threshold_db: 5      # same cutoff v2 used, for continuity/comparability
+    snr_end_weight: 3.0           # matches v2's static oversample_factor at full ramp
+    category_end_weight: 2.0      # new axis v2 didn't have: gunshot-specific oversampling
+    # start weight is always 1.0 (uniform/no oversampling) for both axes --
+    # not configurable separately, since "start at the true distribution" is
+    # definitional to what a curriculum ramp means here, not a free choice.
+
+  # --- Silence-collapse penalty ---
+  # Targets the diagnosed failure mode DIRECTLY: enhanced output going
+  # near-silent in frames where the NOISY INPUT had substantial energy (a
+  # proxy for "something -- likely speech -- was probably there, don't
+  # erase it entirely"). Deliberately NOT a blanket minimum-energy floor
+  # against the clean target (the earlier, weaker idea this replaces) --
+  # that would penalize the model for correctly attenuating genuine
+  # silence/noise-only regions too, which isn't the diagnosed problem.
+  # Keying off the noisy input's OWN energy envelope instead means the
+  # penalty only fires in regions the model itself had reason to believe
+  # were active, regardless of whether the ground-truth clean signal
+  # happens to have speech there -- see the exact formula and its
+  # limitations documented in-code (src/model/finetune.py,
+  # silence_collapse_penalty()), not just here.
+  silence_penalty:
+    weight: 0.05          # small relative to L1+STFT (each ~O(1) combined) -- additive nudge, not a dominant term
+    frame_length: 512     # matches baseline/diagnose_failures STFT window for a consistent frame notion project-wide
+    hop_length: 128        # matches baseline/diagnose_failures hop -- 75% overlap, same convention
+    active_rms_threshold: 0.01   # noisy-frame RMS above this = "likely active" region (relative to normalized [-1,1] float32 audio)
+    suppression_ratio_threshold: 0.1   # penalize only if enhanced_rms / noisy_rms drops below this in an active region -- i.e. output kept less than 10% of the input's energy there
+
+  # --- Kept from v2 (not re-derived, not implicated by any diagnosis) ---
+  # LR schedule: warmup + cosine decay, peak_lr=1.5e-4, min_lr=3e-5,
+  # warmup_ratio=0.05 -- read directly from training_run.lr_schedule above,
+  # unchanged. No diagnosis (v1-vs-v2, over-suppression investigation, or
+  # data-gap analysis) implicated the LR schedule as a cause -- v1 (flat
+  # 3e-5) and v2 (warmup+cosine, peak 1.5e-4) landed at near-identical
+  # STOI/PESQ despite the different schedules, meaning LR shape wasn't
+  # the lever that mattered. Reused via training_run.lr_schedule, not
+  # duplicated into this section.
+
+  # --- Dropped from v2 (explicit, so the diff from v2 is auditable here) ---
+  # - Blanket 3x hard-mixture oversampling (training_run.
+  #   oversample_hard_mixtures) -- REPLACED by curriculum.* above. The old
+  #   key is left in place, untouched, purely for v2 reproducibility; v4's
+  #   training loop (train_v4()) never reads it.
+  # - 2x STFT loss reweighting (loss_weights_v2: stft=2.0) -- REVERTED to
+  #   1:1 L1:STFT for v4 (see loss_weights_v4 below). Not shown to help
+  #   (v2 vs v1 STOI/PESQ were near-identical despite this exact change),
+  #   and stacking an unproven lever on top of two new, deliberately
+  #   evidence-motivated interventions would make v4's result impossible to
+  #   attribute cleanly -- kept out for interpretability, per explicit
+  #   instruction.
+loss_weights_v4:
+  l1: 1.0
+  stft: 1.0
+
+# --- v5: dynamic (on-the-fly) mixing + expanded clean pool + reactive LR ---
+# Root cause (diagnosed with real numbers across v1/v2/v4, see logs.md/
+# context.md v5 diagnosis entries, not repeated here): v1/v2/v4 all plateau
+# at epoch 7-11 and land within ~0.005 STOI / ~0.06 PESQ of each other across
+# every SNR bucket, DESPITE structurally different LR schedules, loss
+# weighting, oversampling, and a curriculum ramp -- because the TRAINING SET
+# ITSELF is static (2162 pre-generated pairs, same every epoch). No
+# optimizer/loss-side lever can add information the model has already
+# exhausted from a fixed small set. v5 fixes the actual bottleneck: dynamic
+# mixing draws a NEW random (clean, noise, SNR, augmentation) combination
+# every __getitem__ call, so every epoch sees genuinely new mixtures, backed
+# by an expanded clean-speech pool (TASK 1, manifests/dynamic_train_pool.json)
+# so the clean-speech side of the combination space is larger too, not just
+# re-mixed at higher SNR-sampling density from the same ~2162 clean clips.
+training_run_v5:
+  batch_size: 8
+  checkpoint_dir: "checkpoints"
+  checkpoint_filename: "dns48_finetuned_v5_best.pt"
+  results_csv: "results/finetune_training_log_v5.csv"
+
+  # --- TASK 2: steps_per_epoch (epochs are now an arbitrary bookkeeping
+  # unit, not "one full pass over N fixed pairs" -- dynamic mixing has no
+  # fixed-size epoch, so this must be picked explicitly) ---
+  # v1/v2/v4 all used steps_per_epoch = 2162 // 8 = 270 (the static train
+  # manifest's natural epoch size at batch_size=8). Kept at the SAME value
+  # here so a v5 epoch's wall-clock is directly comparable to v1/v2/v4's
+  # measured ~130-140s/epoch (same number of optimizer steps per epoch,
+  # same batch size, same model/device -- the only thing that changed is
+  # WHERE each batch's samples come from, not how many steps make an
+  # epoch) -- makes early-stopping patience/epoch-count comparisons across
+  # v1/v2/v4/v5 apples-to-apples rather than requiring a unit conversion.
+  steps_per_epoch: 270
+
+  # --- TASK 5: run config ---
+  # max_epochs high (120, per task instruction) -- with dynamic data, unlike
+  # v1/v2/v4, running longer is finally meaningful: there is no fixed pool to
+  # exhaust, so a plateau (if/when it happens) reflects the model's actual
+  # capacity/data-distribution limit, not running out of distinct training
+  # examples. 120 epochs x 270 steps/epoch x ~140s/epoch (v1-v4's measured
+  # per-epoch wall-clock at this batch size/steps count) ~= 16800s ~= 4.7hr
+  # worst case (full ceiling, no plateau) -- affordable per explicit "time is
+  # not a constraint, correctness is" instruction for this task.
+  max_epochs: 120
+  # Early stopping patience raised to 15 (from v2's 10, v4's 20) -- val
+  # plateau is still the real stopping signal on top of the high ceiling
+  # (per task: "longer training is finally meaningful, but val plateau still
+  # gates it"). 15 sits between v2's 10 (tuned for a comparatively short
+  # 60-epoch ceiling) and v4's 20 (tuned for curriculum's own mid-ramp
+  # false-plateau risk, which v5 does not have -- v5 has no curriculum ramp,
+  # so v4's extra patience margin for ramp-induced fluctuation doesn't apply
+  # here) -- long enough to ride out normal dynamic-mixing sampling noise
+  # (variance from a different random mixture draw each step is expected and
+  # should not false-trigger a stop) without eating a large fraction of the
+  # 120-epoch budget the way v4's patience=20/100-epoch ratio did.
+  early_stopping:
+    min_delta: 0.001
+    patience_epochs: 15
+
+  # --- TASK 2: noise category balance (config value, not hardcoded) ---
+  # v1/v2/v4's static manifest landed at gunshot=32.4%/stationary=34.7%/
+  # general=32.8% (diagnose_data_gaps.py, confirmed roughly 1/3 each per
+  # v4's diagnosis entry) purely because build_dataset.py's rng.choice()
+  # over 3 categories is naturally ~uniform. Dynamic mixing must replicate
+  # that same ~1/3 balance IN EXPECTATION (per task instruction) so v5's
+  # noise-category exposure is comparable to v1/v2/v4's, not skewed by a
+  # different implicit sampling scheme -- explicit uniform weights over the
+  # 3 categories, read from config rather than re-hardcoding rng.choice()'s
+  # implicit uniformity.
+  noise_category_weights:
+    gunshot: 1.0
+    stationary: 1.0
+    general: 1.0
+
+  # --- TASK 2: seeding ---
+  # "Seedable for reproducibility of a given run (config seed), but drawing
+  # new mixtures every epoch" -- the per-sample RNG is seeded ONCE at
+  # DynamicMixDataset construction time (from `seed` above), not reseeded
+  # per epoch/per __getitem__, so a full re-run with the same seed draws the
+  # same overall SEQUENCE of mixtures (reproducible), while within a single
+  # run each successive __getitem__/epoch naturally advances that one RNG
+  # forward and therefore sees different draws than the epoch before it
+  # (satisfies "new mixtures every epoch" without needing a second,
+  # epoch-indexed reseed that would instead make every epoch IDENTICAL to
+  # each other, which is the opposite of what dynamic mixing is for).
+  # No separate config key needed here -- reuses the top-level `seed`.
+
+  # --- TASK 3: reactive LR (warmup, kept ~same as v2, then
+  # ReduceLROnPlateau on val loss) ---
+  lr_schedule_v5:
+    # Warmup: same shape/peak as v2's lr_schedule (peak_lr=1.5e-4,
+    # warmup_ratio=0.05) -- per task instruction "keep ~same warmup as v2".
+    # Reused via training_run.lr_schedule.peak_lr/warmup_ratio below (not
+    # duplicated) so a future change to v2's warmup automatically stays in
+    # sync unless v5 is deliberately decoupled later.
+    peak_lr: 1.5e-4
+    warmup_ratio: 0.05
+    # After warmup: torch.optim.lr_scheduler.ReduceLROnPlateau(factor=0.5,
+    # patience=5, min_lr=1e-5) on val loss, replacing v2/v4's fixed cosine
+    # decay entirely (per task instruction) -- the LR now reacts to the
+    # actual val-loss trajectory instead of following a schedule shaped
+    # around a pre-committed max_epochs, which matters more now that
+    # max_epochs=120 is a loose ceiling rather than a tightly-budgeted
+    # number the cosine curve needs to reach zero by.
+    # factor=0.5: halves LR on each plateau-triggered reduction -- a
+    # standard, moderate ReduceLROnPlateau default (halving is gentle enough
+    # not to collapse learning suddenly, aggressive enough to meaningfully
+    # change the step size versus e.g. factor=0.9's near-no-op).
+    plateau_factor: 0.5
+    # patience=5 epochs: shorter than the early-stopping patience (15) by
+    # design -- the LR should react and try a smaller step size several
+    # epochs BEFORE early stopping gives up entirely, giving the lower LR a
+    # real chance to unstick a plateau before the run ends. 5 is the
+    # standard ReduceLROnPlateau textbook default and is also exactly what
+    # TASK 3 explicitly requested.
+    plateau_patience: 5
+    # min_lr=1e-5: floor below which ReduceLROnPlateau stops reducing
+    # further -- below v2/v4's min_lr=3e-5 floor since v5 has no fixed decay
+    # schedule to "complete"; this is a genuine floor for however many
+    # reductions occur over up to 120 epochs, set low enough that repeated
+    # halvings (1.5e-4 -> 7.5e-5 -> 3.75e-5 -> 1.875e-5 -> ~9e-6, i.e. ~4
+    # reductions) don't hit it prematurely and stop adapting, per explicit
+    # task instruction.
+    min_lr: 1.0e-5
+
+  # --- TASK 4: loss (unchanged from v4, toggleable per pending eval) ---
+  # L1 + multi-resolution STFT kept at 1:1 (loss_weights_v4, reused directly
+  # -- not duplicated into a loss_weights_v5 key, since the values are
+  # identical and v4's key already exists). Silence-collapse penalty
+  # DEFAULTED OFF for v5 (corrected -- was mistakenly left `true`, i.e.
+  # copied from v4's default, in an earlier pass; caught when v5's training
+  # log showed nonzero silence_pen contributing to the loss/gradient from
+  # epoch 1). Off until the user explicitly confirms it should be re-enabled
+  # (e.g. once the v4 epoch-11 eval result is in and shows the penalty
+  # measurably reduced over-suppression counts vs v2) -- toggle is the
+  # one-line change to flip it back on; weight stays
+  # training_run_v4.silence_penalty.weight=0.05, reused directly, unchanged.
+  silence_penalty_enabled: false
+
+# Rough acoustic heuristics to separate "leftover noise" (under-suppression)
+# from "damaged speech" (over-suppression) as a triage signal ahead of manual
+# listening -- see src/eval/diagnose_failures.py docstring for exact method
+# and documented limitations. NOT a validated perceptual metric.
+diagnose_failures:
+  input_csv: "results/finetuned_v2_worst_pairs.csv"
+  output_csv: "results/failure_diagnosis.csv"
+  stft:
+    # Reuses baseline.stft's n_fft/hop_length/win_length values by
+    # convention (same STFT resolution already used for spectral analysis
+    # elsewhere in this project) -- kept as its own separate key so tuning
+    # baseline's spectral-subtraction STFT never silently changes this
+    # diagnostic's resolution.
+    n_fft: 512
+    hop_length: 128
+    win_length: 512
+    window: "hann"
+  # Speech-band frequency range (Hz) used to isolate the speech-distortion
+  # estimate to bins where clean speech actually carries energy -- standard
+  # telephony/speech-band range, wide enough to cover fundamental+formants
+  # for typical adult speech at 16kHz sample rate.
+  speech_band_hz: [80, 8000]
+  # A clean-speech time-frequency bin is only counted toward the speech
+  # distortion estimate if its magnitude exceeds this fraction of the
+  # clean signal's own max magnitude (per-file, relative floor) -- excludes
+  # near-silent clean bins (pauses, breaths) where "distortion" is really
+  # just measuring noise-floor mismatch, not damaged speech.
+  clean_energy_relative_floor: 0.05
+  # Label thresholds: a pair is flagged for a mechanism only if that
+  # mechanism's normalized estimate exceeds this fraction of the pair's
+  # combined (under + over) estimate total -- e.g. 0.6 means one mechanism
+  # must account for >60% of the combined signal to be called out alone;
+  # if both exceed it (impossible by construction, kept for clarity) or
+  # neither does, the pair is labeled "both" or "unclear" respectively.
+  dominant_share_threshold: 0.6
+  # Below this combined (under + over) estimate magnitude, the pair's
+  # signal is too weak/noisy to trust the automated split at all --
+  # labeled "unclear" regardless of the ratio between the two estimates.
+  min_combined_estimate: 1.0e-6
+  # How many pairs to shortlist for manual listening (most-disagreeing /
+  # least-confident automated labels, plus the single worst-overall pair).
+  shortlist_count: 5

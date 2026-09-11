@@ -8,3 +8,10 @@ scipy
 soundfile
 pyyaml
 tqdm
+onnx
+onnxruntime
+onnxscript
+coremltools
+streamlit
+plotly
+pandas
